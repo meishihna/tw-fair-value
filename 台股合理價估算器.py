@@ -12,7 +12,7 @@
 資料來源：FinMind Open Data（https://finmind.github.io/）
 本工具為分析輔助，非投資建議。
 """
-import json, statistics, webbrowser, threading, datetime, sys
+import json, statistics, webbrowser, threading, datetime, sys, collections
 import urllib.request, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -238,6 +238,156 @@ def estimate_ticker(ticker, token="", years=5, basis="median"):
     return result
 
 
+# ---------------------------------------------------------------- 內在價值：DCF / EV-EBITDA / DDM
+# 資料來源與慣例（實測確認）：
+#   TaiwanStockFinancialStatements（損益表）為「單季」值 → 全年 = 該年四季相加。
+#   TaiwanStockCashFlowsStatement（現金流量表）為「累計 YTD」值 → 全年 = 12/31 那筆。
+#   股數 = 稅後淨利(歸母) / EPS（皆全年）。
+def _fin_by_date(rows):
+    d = collections.defaultdict(dict)
+    for x in rows:
+        t = x.get("type")
+        if t and not t.endswith("_per"):
+            d[x["date"]][t] = x["value"]
+    return d
+
+def fetch_financials(ticker, token=""):
+    today = datetime.date.today().isoformat()
+    start = "2019-01-01"
+    IS = _fin_by_date(fetch_finmind("TaiwanStockFinancialStatements", ticker, start, today, token).get("data", []))
+    CF = _fin_by_date(fetch_finmind("TaiwanStockCashFlowsStatement", ticker, start, today, token).get("data", []))
+    BS = _fin_by_date(fetch_finmind("TaiwanStockBalanceSheet", ticker, start, today, token).get("data", []))
+    if not IS:
+        return None
+    years = collections.defaultdict(list)
+    for d in IS:
+        years[d[:4]].append(d)
+    fy = []
+    for y in sorted(years):
+        q = sorted(years[y])
+        if len(q) >= 4 and q[-1].endswith("12-31"):
+            dec = y + "-12-31"
+            issum = lambda k: sum(IS[d].get(k, 0) or 0 for d in q)     # IS 單季相加
+            cfv = lambda k: (CF.get(dec, {}) or {}).get(k, 0) or 0     # CF 取 12/31 累計＝全年
+            rev = issum("Revenue"); ebit = issum("OperatingIncome")
+            if not rev:
+                continue
+            fy.append({"year": int(y), "rev": rev, "ebit": ebit,
+                       "pretax": issum("PreTaxIncome"), "tax": issum("TAX"),
+                       "ni": issum("EquityAttributableToOwnersOfParent"), "eps": issum("EPS"),
+                       "da": cfv("Depreciation") + cfv("AmortizationExpense"),
+                       "capex": abs(cfv("PropertyAndPlantAndEquipment")),
+                       "ebit_margin": ebit / rev})
+    if len(fy) < 2:
+        return None
+    bsq = sorted(BS.keys())[-1] if BS else None
+    B = BS.get(bsq, {}) if bsq else {}
+    cash = B.get("CashAndCashEquivalents", 0) or 0
+    debt = sum(B.get(k, 0) or 0 for k in
+               ["ShortTermBorrowings", "ShorttermBorrowings", "ShortTermBillsPayable",
+                "CurrentPortionOfLongTermLiabilities", "BondsPayable",
+                "LongtermBorrowings", "LongTermBorrowings", "LongTermBillsPayable"])
+    base = fy[-1]
+    shares = base["ni"] / base["eps"] if base.get("eps") else None
+    return {"fy": fy, "bs_date": bsq, "cash": cash, "debt": debt,
+            "net_debt": debt - cash, "equity": B.get("Equity", 0) or 0, "shares": shares}
+
+def _cagr(a, b, n):
+    if a <= 0 or b <= 0 or n <= 0:
+        return None
+    return (b / a) ** (1 / n) - 1
+
+def compute_intrinsic(fin, price, dps=None, a=None):
+    """由自動抓取的年度財報 + 假設，算 DCF / EV-EBITDA / DDM。a=使用者覆寫的假設 dict。"""
+    a = a or {}
+    fy = fin["fy"]; base = fy[-1]
+    rev0 = base["rev"]; shares = fin["shares"]; net_debt = fin["net_debt"]
+    if not (rev0 and shares):
+        return {"ok": False, "error": "財報資料不足（缺營收或股數），無法估算內在價值。"}
+    hist = fy[-4:] if len(fy) >= 4 else fy
+    rev_cagr = _cagr(hist[0]["rev"], base["rev"], len(hist) - 1) or 0.08
+    # 自動預填假設（使用者可覆寫）
+    g   = float(a.get("growth",   max(0.02, min(rev_cagr, 0.20))))
+    m   = float(a.get("ebit_margin", statistics.fmean([f["ebit_margin"] for f in hist])))
+    tax = float(a.get("tax", 0.20))
+    dap = float(a.get("da_pct",    statistics.fmean([f["da"] / f["rev"] for f in hist])))
+    cxp = float(a.get("capex_pct", statistics.fmean([f["capex"] / f["rev"] for f in hist])))
+    nwcp = float(a.get("nwc_pct", 0.10))
+    tg  = float(a.get("term_g", 0.025))
+    rf  = float(a.get("rf", 0.016)); erp = float(a.get("erp", 0.06)); beta = float(a.get("beta", 1.0))
+    ke = rf + beta * erp
+    mv_e = price * shares; mv_d = max(fin["debt"], 0)
+    kd = float(a.get("kd", 0.025)) * (1 - tax)
+    wacc = float(a.get("wacc", (mv_e * ke + mv_d * kd) / (mv_e + mv_d) if (mv_e + mv_d) else ke))
+    N = int(a.get("n", 5))
+    if wacc <= tg:                      # 保護：WACC 必須 > 永續成長率
+        wacc = tg + 0.01
+    rows = []; prev = rev0
+    for t in range(1, N + 1):
+        rev = rev0 * (1 + g) ** t
+        ebit = rev * m; nopat = ebit * (1 - tax)
+        fcff = nopat + rev * dap - rev * cxp - (rev - prev) * nwcp
+        rows.append({"t": t, "rev": rev, "ebit": ebit, "fcff": fcff, "pv": fcff / (1 + wacc) ** t})
+        prev = rev
+    tv = rows[-1]["fcff"] * (1 + tg) / (wacc - tg)
+    ev = sum(r["pv"] for r in rows) + tv / (1 + wacc) ** N
+    dcf_ps = (ev - net_debt) / shares
+    # EV/EBITDA：以目前（或指定）倍數 roll 到明年 EBITDA
+    ebitda0 = base["ebit"] + base["da"]
+    cur_mult = (price * shares + net_debt) / ebitda0 if ebitda0 else None
+    tmult = float(a["ev_ebitda"]) if a.get("ev_ebitda") else cur_mult
+    fwd_ebitda = rows[0]["rev"] * (m + dap)
+    evm_ps = (tmult * fwd_ebitda - net_debt) / shares if tmult else None
+    # DDM（Gordon）
+    ddm_ps = None
+    if dps:
+        gd = float(a.get("div_g", min(tg, ke - 0.005)))
+        ddm_ps = dps * (1 + gd) / (ke - gd) if ke > gd else None
+    fairs = [x for x in (dcf_ps, evm_ps, ddm_ps) if x and x > 0]
+    return {"ok": True,
+            "dcf_ps": round(dcf_ps, 1),
+            "evm_ps": round(evm_ps, 1) if evm_ps else None,
+            "ddm_ps": round(ddm_ps, 1) if ddm_ps else None,
+            "cur_ev_ebitda": round(cur_mult, 1) if cur_mult else None,
+            "fwd_ebitda": round(fwd_ebitda, 0),
+            "ev": round(ev, 0), "net_debt": round(net_debt, 0),
+            "shares": round(shares, 3), "price": price, "dps0": round(dps, 2) if dps else None,
+            "base_year": base["year"], "fy_years": [f["year"] for f in fy],
+            "rev_cagr": round(rev_cagr, 4),
+            # 回傳採用的假設，供前端預填輸入欄
+            "assum": {"growth": round(g, 4), "ebit_margin": round(m, 4), "tax": round(tax, 4),
+                      "da_pct": round(dap, 4), "capex_pct": round(cxp, 4), "nwc_pct": round(nwcp, 4),
+                      "term_g": round(tg, 4), "wacc": round(wacc, 4), "ke": round(ke, 4),
+                      "beta": beta, "rf": rf, "erp": erp, "n": N,
+                      "ev_ebitda": round(tmult, 1) if tmult else None}}
+
+def estimate_intrinsic(ticker, token="", a=None):
+    ticker = ticker.strip()
+    if not ticker.isdigit():
+        return {"ok": False, "error": "請輸入數字代碼（例如 2330）。"}
+    today = datetime.date.today()
+    recent = (today - datetime.timedelta(days=20)).isoformat()
+    try:
+        fin = fetch_financials(ticker, token)
+    except Exception as e:
+        return {"ok": False, "error": f"連線資料來源失敗：{e}"}
+    if not fin:
+        return {"ok": False, "error": "查無足夠的年度財報（至少需兩個完整會計年度）。"}
+    try:
+        pr = fetch_finmind("TaiwanStockPrice", ticker, recent, today.isoformat(), token).get("data", [])
+        price = next((r["close"] for r in reversed(pr) if isinstance(r.get("close"), (int, float)) and r["close"] > 0), None)
+        per = fetch_finmind("TaiwanStockPER", ticker, recent, today.isoformat(), token).get("data", [])
+        yld = next((r.get("dividend_yield") for r in reversed(per) if r.get("dividend_yield")), 0) or 0
+    except Exception as e:
+        return {"ok": False, "error": f"連線資料來源失敗：{e}"}
+    if not price:
+        return {"ok": False, "error": "查無目前股價。"}
+    dps = price * yld / 100 if yld else None
+    res = compute_intrinsic(fin, price, dps, a)
+    res["ticker"] = ticker
+    return res
+
+
 # ---------------------------------------------------------------- 前端頁面
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -341,6 +491,23 @@ PAGE = r"""<!DOCTYPE html>
   .rlegend{display:flex;flex-wrap:wrap;gap:6px 16px;font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);margin-top:10px}
   .rlegend i{display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:-2px;margin-right:5px;border:1px solid var(--line-strong)}
   .rlegend i.ln{width:16px;height:0;border:0;border-top:2px solid var(--ink);border-radius:0;vertical-align:2px}
+  /* 內在價值面板 */
+  #intrinsic{margin-top:14px}
+  .ivbtn{font-family:var(--sans);font-weight:700;font-size:14px;padding:11px 18px;border:1px solid var(--ink);
+    background:#fff;color:var(--ink);border-radius:2px;cursor:pointer;width:100%;letter-spacing:.03em}
+  .ivbtn:hover{background:var(--ink);color:#fff}
+  #ivRecalc{width:auto;font-size:13px;padding:7px 22px}
+  .ivgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px 14px}
+  @media(min-width:560px){.ivgrid{grid-template-columns:repeat(4,1fr)}}
+  .ivfield{display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--ink-soft);position:relative}
+  .ivfield input{font-family:var(--mono);font-size:14px;padding:6px 22px 6px 8px;border:1px solid var(--line-strong);
+    border-radius:2px;background:#fff;color:var(--ink);width:100%}
+  .ivfield input:focus{border-color:var(--brass);outline:none;box-shadow:inset 0 0 0 1px var(--brass)}
+  .ivfield i{position:absolute;right:8px;bottom:7px;font-style:normal;font-family:var(--mono);font-size:12px;color:var(--ink-soft)}
+  .ivmeta{font-family:var(--mono);font-size:11.5px;color:var(--ink-soft);display:block;margin-top:8px}
+  .ivnote{font-size:11px;color:var(--ink-soft)}
+  tr.iv-cheap td.num{color:var(--up)}
+  tr.iv-rich td.num{color:var(--down)}
   /* breakdown table */
   table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13.5px}
   td{padding:9px 22px;border-bottom:1px solid var(--line)}
@@ -489,6 +656,59 @@ function riverPanel(d){
   </div>`;
 }
 
+// ---- 內在價值（DCF / EV-EBITDA / DDM）----
+async function loadIntrinsic(overrides){
+  const box=document.getElementById('intrinsic'); if(!box||!lastTicker) return;
+  box.innerHTML=`<div class="state"><span class="spin"></span>抓取財報、計算內在價值…（DCF · EV/EBITDA · DDM）</div>`;
+  let u='/api/intrinsic?ticker='+encodeURIComponent(lastTicker)+(tok.value.trim()?'&token='+encodeURIComponent(tok.value.trim()):'');
+  if(overrides) for(const k in overrides){ if(overrides[k]!==''&&overrides[k]!=null) u+='&'+k+'='+encodeURIComponent(overrides[k]); }
+  try{ const r=await fetch(u); renderIntrinsic(await r.json()); }
+  catch(e){ box.innerHTML=`<div class="state err">⚠ 無法取得：${e}</div>`; }
+}
+function renderIntrinsic(d){
+  const box=document.getElementById('intrinsic'); if(!box) return;
+  if(!d.ok){ box.innerHTML=`<div class="state err">⚠ ${d.error}</div>`; return; }
+  const a=d.assum, price=d.price;
+  const up=v=> (v&&price)?(v/price-1):null;
+  const tone=v=>{const u=up(v); return u==null?'':(u>=0.05?'iv-cheap':u<=-0.05?'iv-rich':'');};
+  const row=(name,v,note)=>`<tr class="${tone(v)}"><td class="lab">${name}${note?` <span class="ivnote">${note}</span>`:''}</td><td class="num">${v?nf(v,1):'—'}</td><td class="num">${v?pf(up(v)):'—'}</td></tr>`;
+  const pin=(k,label,val,unit)=>`<label class="ivfield"><span>${label}</span><input class="ivin" data-k="${k}" data-pct="${unit==='%'?1:0}" value="${val==null?'':(unit==='%'?(val*100).toFixed(1):val)}"><i>${unit}</i></label>`;
+  const B=1e9;
+  box.innerHTML=`<div class="panel ivpanel">
+    <div class="band">
+      <h3 style="margin-bottom:12px">內在價值分析　<span>DCF · EV/EBITDA · DDM｜基準年 FY${d.base_year}｜近 ${d.fy_years.length-1} 年營收 CAGR ${(d.rev_cagr*100).toFixed(1)}%</span></h3>
+      <div class="ivgrid">
+        ${pin('growth','營收成長率',a.growth,'%')}
+        ${pin('ebit_margin','EBIT 利潤率',a.ebit_margin,'%')}
+        ${pin('tax','稅率',a.tax,'%')}
+        ${pin('da_pct','D&A / 營收',a.da_pct,'%')}
+        ${pin('capex_pct','資本支出 / 營收',a.capex_pct,'%')}
+        ${pin('term_g','永續成長率',a.term_g,'%')}
+        ${pin('wacc','WACC',a.wacc,'%')}
+        ${pin('ev_ebitda','目標 EV/EBITDA',a.ev_ebitda,'x')}
+      </div>
+      <div style="margin-top:12px"><button class="ivbtn" id="ivRecalc">重算</button></div>
+      <span class="ivmeta">目前股價 ${nf(price,1)}｜淨${d.net_debt<0?'現金':'負債'} ${nf(Math.abs(d.net_debt)/B,1)}B｜股數 ${nf(d.shares/B,2)}B｜明年 EBITDA ${nf(d.fwd_ebitda/B,0)}B｜目前 EV/EBITDA ${d.cur_ev_ebitda?nf(d.cur_ev_ebitda,1)+'x':'—'}</span>
+    </div>
+    <table>
+      <tr><td class="lab" style="font-family:var(--sans);color:var(--ink)">方法</td><td class="num" style="color:var(--ink)">每股價值</td><td class="num" style="color:var(--ink)">vs 現價</td></tr>
+      ${row('DCF（自由現金流折現）',d.dcf_ps)}
+      ${row(`EV/EBITDA（${a.ev_ebitda?nf(a.ev_ebitda,1):'—'}x × 明年 EBITDA）`,d.evm_ps)}
+      ${row('DDM（股利折現）',d.ddm_ps,d.dps0?`DPS ${nf(d.dps0,2)}`:'目前無配息')}
+    </table>
+    <div class="foot">⚠ 內在價值為<b>假設驅動</b>的估計，對成長率／利潤率／WACC／永續成長極敏感，宜當基準與敏感度分析、<b>非精準目標價</b>。DCF 對高資本支出（重投資期）公司易偏保守；EV/EBITDA 預設以目前倍數 roll，近似「同倍數下的明年價」，可改成你的目標倍數；DDM 對低配息成長股天生偏低。資料：FinMind 年度財報（基準 FY${d.base_year}）。</div>
+  </div>`;
+  document.getElementById('ivRecalc').onclick=()=>{
+    const ov={};
+    box.querySelectorAll('.ivin').forEach(inp=>{
+      let v=parseFloat(inp.value); if(isNaN(v)) return;
+      if(inp.dataset.pct==='1') v=v/100;
+      ov[inp.dataset.k]=v;
+    });
+    loadIntrinsic(ov);
+  };
+}
+
 function render(d){
   if(!d.ok){ out.innerHTML=`<div class="state err">⚠ ${d.error}</div>`; return; }
   const cls = d.tone==='cheap'?'t-cheap':d.tone==='rich'?'t-rich':'t-fair';
@@ -527,7 +747,9 @@ function render(d){
     方法：以個股近 ${d.years} 年<b>本益比 / 股價淨值比 / 殖利率的歷史${bl}</b>為「典型水準」，回推合理價（殖利率法：現價 × 目前殖利率 ÷ ${bl}殖利率）。三者可用者取平均；近期虧損時排除本益比、無配息時排除殖利率。它回答的是「若估值回到自身歷史常態、價格會落在哪」，<b>不是</b>對未來獲利的預測。<br>
     因此對高成長股（例如 AI 概念）容易顯示「偏貴」——市場給的高倍數可能有其道理，這個模型看不到未來成長，請斟酌。<br>
     資料：FinMind（本益比截至 ${d.per_date||'—'}、股價截至 ${d.price_date||'—'}）。本工具為分析輔助，非投資建議。
-  </div>`;
+  </div>
+  <div id="intrinsic"><button class="ivbtn" id="loadIV">＋ 展開內在價值分析（DCF · EV/EBITDA · DDM）</button></div>`;
+  const lb=document.getElementById('loadIV'); if(lb) lb.onclick=()=>loadIntrinsic();
 }
 
 let curYears=5, curBasis='median', lastTicker='';
@@ -587,6 +809,27 @@ class Handler(BaseHTTPRequestHandler):
             basis = q.get("basis", ["median"])[0]
             try:
                 res = estimate_ticker(ticker, token, years, basis)
+            except Exception as e:
+                res = {"ok": False, "error": f"程式錯誤：{e}"}
+            self._send(200, json.dumps(res, ensure_ascii=False))
+            return
+        if parsed.path == "/api/intrinsic":
+            q = urllib.parse.parse_qs(parsed.query)
+            ticker = q.get("ticker", [""])[0]
+            token = q.get("token", [""])[0]
+            # 只收白名單假設，數值化；空值代表沿用自動預填
+            keys = ("growth", "ebit_margin", "tax", "da_pct", "capex_pct", "nwc_pct",
+                    "term_g", "wacc", "beta", "rf", "erp", "kd", "ev_ebitda", "div_g", "n")
+            a = {}
+            for k in keys:
+                v = q.get(k, [""])[0]
+                if v != "":
+                    try:
+                        a[k] = float(v)
+                    except ValueError:
+                        pass
+            try:
+                res = estimate_intrinsic(ticker, token, a)
             except Exception as e:
                 res = {"ok": False, "error": f"程式錯誤：{e}"}
             self._send(200, json.dumps(res, ensure_ascii=False))

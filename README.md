@@ -1,7 +1,8 @@
 # 台股合理價估算器 · Taiwan Stock Fair-Value Estimator
 
 一支**零安裝、單檔**的 Python 網頁小工具：只要輸入台股代碼（例如 `2330`、`2368`、`2337`），
-就自動抓資料、用「歷史倍數回歸法」算出**預估合理價**——**完全不需要手動輸入任何財報數字**。
+就自動抓資料估出**預估合理價**。兩層估值：**①歷史倍數回歸**（不需任何輸入）＋**②內在價值模型
+（DCF / EV-EBITDA / DDM）**，後者自動用財報預填假設、可即時微調。
 
 <p align="center">
   <img src="docs/screenshot.png" alt="台股合理價估算器介面" width="420">
@@ -40,12 +41,36 @@ PER / PBR / 殖利率快照。介面另提供：
 
 **顏色慣例（台股）**：紅＝偏低／上漲潛力、綠＝偏貴／下跌潛力。
 
+## 內在價值分析（DCF · EV/EBITDA · DDM）
+
+歷史回歸看的是「估值回到常態」，看不到未來成長；因此另加一層**內在價值模型**。點結果下方的
+「展開內在價值分析」即會**自動抓取 FinMind 年度三表財報**，用歷史數字**預填假設**並算出三法估值——
+所有假設（營收成長、EBIT 利潤率、稅率、D&A%、資本支出%、永續成長、WACC、目標 EV/EBITDA）
+都可**即時編輯、按「重算」重跑**。
+
+<p align="center">
+  <img src="docs/intrinsic.png" alt="內在價值分析面板" width="420">
+</p>
+
+| 方法 | 說明 |
+|---|---|
+| **DCF** | 五年自由現金流（FCFF）折現 + 永續成長終值；WACC 以 CAPM 自動估算 |
+| **EV/EBITDA** | 以目前（或自訂目標）倍數 × 明年 EBITDA，扣淨負債得每股值 |
+| **DDM** | Gordon 股利折現（僅對穩定配息股有意義） |
+
+> ⚠️ 內在價值為**假設驅動**的估計，對成長率／利潤率／WACC／永續成長極敏感，宜當基準與敏感度分析、
+> **非精準目標價**。DCF 對重資本支出公司易偏保守；DDM 對低配息成長股天生偏低。
+
+**財報年度化慣例（實測）**：FinMind 損益表為**單季**值（全年＝四季相加）、現金流量表為**累計 YTD**
+（全年＝12/31 那筆）、股數＝稅後淨利 ÷ EPS。
+
 ## 資料來源
 
 [FinMind Open Data](https://finmind.github.io/) — `https://api.finmindtrade.com/api/v4/data`
 
 - `TaiwanStockPER` → `{date, stock_id, dividend_yield, PER, PBR}`（每日）
 - `TaiwanStockPrice` → `{date, stock_id, ..., close, ...}`（每日）
+- `TaiwanStockFinancialStatements` / `TaiwanStockBalanceSheet` / `TaiwanStockCashFlowsStatement`（季度，供內在價值模型）
 - 免費上限 300 次/小時；註冊免費 Token 後 600 次/小時（介面有選填欄位）。
 
 ## 授權
