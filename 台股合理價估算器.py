@@ -46,8 +46,9 @@ def _percentile(series, q):
     hi = min(lo + 1, len(s) - 1)
     return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
-def compute_valuation(per_rows, price_rows):
-    """吃 FinMind 原始資料列，回傳估值結果 dict。"""
+def compute_valuation(per_rows, price_rows, basis="median"):
+    """吃 FinMind 原始資料列，回傳估值結果 dict。basis: 'median' 中位 或 'mean' 平均。"""
+    typ_fn = statistics.fmean if basis == "mean" else statistics.median
     per_series = [r["PER"] for r in per_rows if isinstance(r.get("PER"), (int, float)) and r["PER"] > 0]
     pbr_series = [r["PBR"] for r in per_rows if isinstance(r.get("PBR"), (int, float)) and r["PBR"] > 0]
 
@@ -74,12 +75,15 @@ def compute_valuation(per_rows, price_rows):
     med_pbr = statistics.median(pbr_series) if pbr_series else None
     avg_per = round(statistics.fmean(per_series), 2) if per_series else None
     avg_pbr = round(statistics.fmean(pbr_series), 2) if pbr_series else None
+    # 「典型倍數」依 basis 取中位或平均；估值與 gauge 中心線都用它
+    typ_per = typ_fn(per_series) if per_series else None
+    typ_pbr = typ_fn(pbr_series) if pbr_series else None
 
     eps  = close / cur_per if cur_per else None
     bvps = close / cur_pbr if cur_pbr else None
 
-    fair_pe = med_per * eps if (have_pe and eps) else None
-    fair_pb = med_pbr * bvps if (have_pb and bvps) else None
+    fair_pe = typ_per * eps if (have_pe and eps) else None
+    fair_pb = typ_pbr * bvps if (have_pb and bvps) else None
 
     # 第三法：殖利率回歸（存股/高息股觀點）。合理價 = 現價 × 目前殖利率 ÷ 歷史中位殖利率。
     # 殖利率是估值的倒數：目前殖利率高於中位＝相對便宜，故比率用「目前÷中位」（與 P/E、P/B 相反）。
@@ -90,8 +94,9 @@ def compute_valuation(per_rows, price_rows):
                    if isinstance(r.get("dividend_yield"), (int, float)) and r["dividend_yield"] > 0]
     cur_yld = statistics.median(recent_ylds) if recent_ylds else None
     med_yld = statistics.median(yld_series) if yld_series else None
+    typ_yld = typ_fn(yld_series) if yld_series else None
     have_div = len(yld_series) >= 20 and cur_yld is not None and len(recent_ylds) >= 5
-    fair_div = close * cur_yld / med_yld if (have_div and med_yld) else None
+    fair_div = close * cur_yld / typ_yld if (have_div and typ_yld) else None
 
     # 近期虧損判定：FinMind 對虧損股回傳 PER=0。看最近約 40 個交易日，若過半 PER 無效，
     # 視為目前虧損；此時 P/E 法以獲利年代倍數硬套當前價，參考性低 → 綜合價僅採股價淨值比法。
@@ -175,6 +180,10 @@ def compute_valuation(per_rows, price_rows):
         "med_per": round(med_per, 2) if med_per else None,
         "med_pbr": round(med_pbr, 2) if med_pbr else None,
         "avg_per": avg_per, "avg_pbr": avg_pbr,
+        "typ_per": round(typ_per, 2) if typ_per else None,
+        "typ_pbr": round(typ_pbr, 2) if typ_pbr else None,
+        "typ_yld": round(typ_yld, 2) if typ_yld else None,
+        "basis": basis,
         "yield": round(yld, 2) if isinstance(yld, (int, float)) else None,
         "eps": round(eps, 2) if eps else None,
         "bvps": round(bvps, 2) if bvps else None,
@@ -190,18 +199,20 @@ def compute_valuation(per_rows, price_rows):
         "pe_stale": pe_stale, "use_pe": use_pe,
         "years": round(len(per_series) / 250, 1),
         "n": len(per_series),
-        "per_band": band(per_series, cur_per, med_per) if have_pe else None,
-        "pbr_band": band(pbr_series, cur_pbr, med_pbr) if have_pb else None,
-        "div_band": band(yld_series, cur_yld, med_yld) if have_div else None,
+        "per_band": band(per_series, cur_per, typ_per) if have_pe else None,
+        "pbr_band": band(pbr_series, cur_pbr, typ_pbr) if have_pb else None,
+        "div_band": band(yld_series, cur_yld, typ_yld) if have_div else None,
     }
 
 
-def estimate_ticker(ticker, token=""):
+def estimate_ticker(ticker, token="", years=5, basis="median"):
     ticker = ticker.strip()
     if not ticker.isdigit():
         return {"ok": False, "error": "請輸入數字代碼（例如 2330）。"}
+    years = years if years in (3, 5, 10) else 5
+    basis = basis if basis in ("median", "mean") else "median"
     today = datetime.date.today()
-    start = (today - datetime.timedelta(days=365 * 5 + 30)).isoformat()
+    start = (today - datetime.timedelta(days=365 * years + 30)).isoformat()
     end = today.isoformat()
     try:
         per = fetch_finmind("TaiwanStockPER", ticker, start, end, token)
@@ -221,8 +232,9 @@ def estimate_ticker(ticker, token=""):
         price = fetch_finmind("TaiwanStockPrice", ticker, start, end, token)
     except Exception as e:
         return {"ok": False, "error": f"連線資料來源失敗：{e}"}
-    result = compute_valuation(per_rows, price.get("data", []))
+    result = compute_valuation(per_rows, price.get("data", []), basis)
     result["ticker"] = ticker
+    result["years_req"] = years
     return result
 
 
@@ -281,6 +293,15 @@ PAGE = r"""<!DOCTYPE html>
   details.tok summary::-webkit-details-marker{display:none}
   details.tok input{margin-top:8px;width:100%;font-family:var(--mono);font-size:13px;padding:8px 10px;
     border:1px solid var(--line-strong);border-radius:2px;background:#fff}
+  /* control row: 回看年數 / 中位↔平均 */
+  .ctrl{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:0 18px 16px}
+  .ctrl .lbl{font-size:12.5px;color:var(--ink-soft)}
+  .seg{display:inline-flex;border:1px solid var(--line-strong);border-radius:2px;overflow:hidden}
+  .seg button{font-family:var(--mono);font-size:12.5px;padding:5px 12px;border:0;border-left:1px solid var(--line-strong);
+    background:#fff;color:var(--ink-soft);cursor:pointer}
+  .seg button:first-child{border-left:0}
+  .seg button:hover{color:var(--brass)}
+  .seg button.on{background:var(--ink);color:#fff}
   /* ---- result ---- */
   #out{margin-top:22px}
   .state{color:var(--ink-soft);font-size:14px;padding:8px 2px}
@@ -343,7 +364,7 @@ PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div class="brandrow"><span class="mark">FAIR<span class="dot">·</span>VALUE</span></div>
   <h1>台股合理價估算</h1>
-  <p class="lede">輸入代碼即可。用該股近五年的本益比與股價淨值比，回歸歷史典型倍數推估合理價 —— 不需要你填任何財報數字。</p>
+  <p class="lede">輸入代碼即可。用該股歷史本益比、股價淨值比與殖利率，回歸典型倍數推估合理價 —— 不需要你填任何財報數字。年數與中位／平均可自行切換。</p>
 
   <div class="panel">
     <div class="askrow">
@@ -356,6 +377,19 @@ PAGE = r"""<!DOCTYPE html>
       <span class="chip" data-t="2368">2368 金像電</span>
       <span class="chip" data-t="2337">2337 旺宏</span>
       <span class="chip" data-t="2454">2454 聯發科</span>
+    </div>
+    <div class="ctrl">
+      <span class="lbl">回看年數</span>
+      <div class="seg" id="segYears">
+        <button data-y="3">3 年</button>
+        <button data-y="5" class="on">5 年</button>
+        <button data-y="10">10 年</button>
+      </div>
+      <span class="lbl">典型倍數</span>
+      <div class="seg" id="segBasis">
+        <button data-b="median" class="on">中位</button>
+        <button data-b="mean">平均</button>
+      </div>
     </div>
     <details class="tok">
       <summary>流量不夠？填入 FinMind 免費 Token（選填）</summary>
@@ -376,8 +410,9 @@ function pos(band,val){ // 0..100 位置，夾在 lo..hi 視窗內
   const lo=band.lo, hi=band.hi; if(hi<=lo) return 50;
   return Math.max(2,Math.min(98,(val-lo)/(hi-lo)*100));
 }
-function gauge(title,unit,band,inv){
+function gauge(title,unit,band,inv,bl){
   if(!band||band.cur==null) return '';
+  bl=bl||'中位';
   const curPos=pos(band,band.cur), medPos=band.med!=null?pos(band,band.med):null;
   // inv=true 用於殖利率：數值越高＝越便宜，故左右語意與色帶相反
   const leftLab  = inv?`偏貴 ${nf(band.lo,2)}${unit}`:`便宜 ${nf(band.lo,2)}${unit}`;
@@ -388,10 +423,10 @@ function gauge(title,unit,band,inv){
   return `<div class="band">
     <h3>${title}　<span>目前 ${nf(band.cur,2)}${unit}</span></h3>
     <div class="track${inv?' inv':''}">
-      ${medPos!=null?`<div class="tick med" style="left:${medPos}%" title="歷史中位 ${nf(band.med,2)}"></div>`:''}
+      ${medPos!=null?`<div class="tick med" style="left:${medPos}%" title="歷史${bl} ${nf(band.med,2)}"></div>`:''}
       <div class="cur" style="left:${curPos}%"><b>${nf(band.cur,2)}</b><i></i></div>
     </div>
-    <div class="scale"><span>${leftLab}</span><span>歷史中位 ${nf(band.med,2)}${unit}</span><span>${rightLab}</span></div>
+    <div class="scale"><span>${leftLab}</span><span>歷史${bl} ${nf(band.med,2)}${unit}</span><span>${rightLab}</span></div>
     <div class="bandnote">${note}</div>
   </div>`;
 }
@@ -457,6 +492,7 @@ function riverPanel(d){
 function render(d){
   if(!d.ok){ out.innerHTML=`<div class="state err">⚠ ${d.error}</div>`; return; }
   const cls = d.tone==='cheap'?'t-cheap':d.tone==='rich'?'t-rich':'t-fair';
+  const bl = d.basis==='mean'?'平均':'中位';
   out.innerHTML = `<div class="panel ${cls}">
     <div class="hero">
       <div class="fairbox">
@@ -476,33 +512,46 @@ function render(d){
       ${d.yield!=null?`<span>殖利率 <b>${nf(d.yield,2)}%</b></span>`:''}
       <span>近 <b>${d.years}</b> 年 · ${d.n} 筆</span>
     </div>
-    ${gauge('本益比 區間','x',d.per_band)}
-    ${gauge('股價淨值比 區間','x',d.pbr_band)}
-    ${gauge('殖利率 區間','%',d.div_band,true)}
+    ${gauge('本益比 區間','x',d.per_band,false,bl)}
+    ${gauge('股價淨值比 區間','x',d.pbr_band,false,bl)}
+    ${gauge('殖利率 區間','%',d.div_band,true,bl)}
     ${riverPanel(d)}
     <table>
-      <tr class="${d.pe_stale?'excl':''}"><td class="lab">本益比法　歷史中位 ${nf(d.med_per,2)}x × EPS ${nf(d.eps,2)}${d.pe_stale?'<span class="excl-tag">近期虧損，未納入</span>':''}</td><td class="num">${nf(d.fair_pe,1)}</td></tr>
-      <tr><td class="lab">股價淨值比法　歷史中位 ${nf(d.med_pbr,2)}x × 淨值 ${nf(d.bvps,2)}</td><td class="num">${nf(d.fair_pb,1)}</td></tr>
-      ${d.fair_div!=null?`<tr><td class="lab">殖利率法　現價 × 目前殖利率 ${nf(d.cur_yld,2)}% ÷ 中位 ${nf(d.med_yld,2)}%</td><td class="num">${nf(d.fair_div,1)}</td></tr>`:''}
+      <tr class="${d.pe_stale?'excl':''}"><td class="lab">本益比法　歷史${bl} ${nf(d.typ_per,2)}x × EPS ${nf(d.eps,2)}${d.pe_stale?'<span class="excl-tag">近期虧損，未納入</span>':''}</td><td class="num">${nf(d.fair_pe,1)}</td></tr>
+      <tr><td class="lab">股價淨值比法　歷史${bl} ${nf(d.typ_pbr,2)}x × 淨值 ${nf(d.bvps,2)}</td><td class="num">${nf(d.fair_pb,1)}</td></tr>
+      ${d.fair_div!=null?`<tr><td class="lab">殖利率法　現價 × 目前殖利率 ${nf(d.cur_yld,2)}% ÷ ${bl} ${nf(d.typ_yld,2)}%</td><td class="num">${nf(d.fair_div,1)}</td></tr>`:''}
       <tr class="tot"><td class="lab">綜合合理價（${d.method_label}）</td><td class="num">${nf(d.estimate,1)}</td></tr>
     </table>
   </div>
   <div class="foot">
-    方法：以個股近五年<b>本益比 / 股價淨值比 / 殖利率的歷史中位數</b>為「典型水準」，回推合理價（殖利率法：現價 × 目前殖利率 ÷ 中位殖利率）。三者可用者取平均；近期虧損時排除本益比、無配息時排除殖利率。它回答的是「若估值回到自身歷史常態、價格會落在哪」，<b>不是</b>對未來獲利的預測。<br>
+    方法：以個股近 ${d.years} 年<b>本益比 / 股價淨值比 / 殖利率的歷史${bl}</b>為「典型水準」，回推合理價（殖利率法：現價 × 目前殖利率 ÷ ${bl}殖利率）。三者可用者取平均；近期虧損時排除本益比、無配息時排除殖利率。它回答的是「若估值回到自身歷史常態、價格會落在哪」，<b>不是</b>對未來獲利的預測。<br>
     因此對高成長股（例如 AI 概念）容易顯示「偏貴」——市場給的高倍數可能有其道理，這個模型看不到未來成長，請斟酌。<br>
     資料：FinMind（本益比截至 ${d.per_date||'—'}、股價截至 ${d.price_date||'—'}）。本工具為分析輔助，非投資建議。
   </div>`;
 }
 
+let curYears=5, curBasis='median', lastTicker='';
 async function run(){
   const t=tk.value.trim(); if(!t) return;
-  go.disabled=true; out.innerHTML=`<div class="state"><span class="spin"></span>估算中…（抓取 ${t} 的歷史估值資料）</div>`;
+  lastTicker=t;
+  go.disabled=true; out.innerHTML=`<div class="state"><span class="spin"></span>估算中…（抓取 ${t} 近 ${curYears} 年的歷史估值資料）</div>`;
   try{
-    const u='/api/estimate?ticker='+encodeURIComponent(t)+(tok.value.trim()?'&token='+encodeURIComponent(tok.value.trim()):'');
+    const u='/api/estimate?ticker='+encodeURIComponent(t)+'&years='+curYears+'&basis='+curBasis
+      +(tok.value.trim()?'&token='+encodeURIComponent(tok.value.trim()):'');
     const r=await fetch(u); const d=await r.json(); render(d);
   }catch(e){ out.innerHTML=`<div class="state err">⚠ 無法取得結果：${e}</div>`; }
   go.disabled=false;
 }
+// 分段控制：切換後若已有查詢結果，立即用新參數重算
+function seg(id,attr,set){
+  document.querySelectorAll('#'+id+' button').forEach(b=>b.onclick=()=>{
+    document.querySelectorAll('#'+id+' button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); set(b.dataset[attr]);
+    if(lastTicker) run();
+  });
+}
+seg('segYears','y',v=>curYears=+v);
+seg('segBasis','b',v=>curBasis=v);
 go.onclick=run;
 tk.addEventListener('keydown',e=>{if(e.key==='Enter')run();});
 document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{tk.value=c.dataset.t;run();});
@@ -532,7 +581,12 @@ class Handler(BaseHTTPRequestHandler):
             ticker = (q.get("ticker", [""])[0])
             token = (q.get("token", [""])[0])
             try:
-                res = estimate_ticker(ticker, token)
+                years = int(q.get("years", ["5"])[0])
+            except ValueError:
+                years = 5
+            basis = q.get("basis", ["median"])[0]
+            try:
+                res = estimate_ticker(ticker, token, years, basis)
             except Exception as e:
                 res = {"ok": False, "error": f"程式錯誤：{e}"}
             self._send(200, json.dumps(res, ensure_ascii=False))
