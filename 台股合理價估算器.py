@@ -12,15 +12,27 @@
 資料來源：FinMind Open Data（https://finmind.github.io/）
 本工具為分析輔助，非投資建議。
 """
-import json, statistics, webbrowser, threading, datetime, sys, collections
+import json, statistics, webbrowser, threading, datetime, sys, collections, time
 import urllib.request, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FINMIND = "https://api.finmindtrade.com/api/v4/data"
 
+# 本機快取：同參數查詢在 TTL 內直接用記憶體結果，不重打 API。
+# 一次「內在價值」要打 5 支 API，且「重算」只改假設不改財報 —— 有快取後重算＝0 次呼叫。
+CACHE_TTL = 900          # 秒（15 分鐘）；股價/財報以日為單位，同一 session 內用快取安全
+_cache = {}
+_cache_lock = threading.Lock()
 
-# ---------------------------------------------------------------- 資料抓取
+
+# ---------------------------------------------------------------- 資料抓取（含快取）
 def fetch_finmind(dataset, data_id, start_date, end_date, token=""):
+    key = (dataset, data_id, start_date, end_date, token)
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and now - hit[0] < CACHE_TTL:
+            return hit[1]
     params = {"dataset": dataset, "data_id": data_id,
               "start_date": start_date, "end_date": end_date}
     if token:
@@ -28,7 +40,12 @@ def fetch_finmind(dataset, data_id, start_date, end_date, token=""):
     url = FINMIND + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"User-Agent": "tw-fairprice/1.0"})
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+        data = json.loads(r.read().decode("utf-8"))
+    # 只快取「成功且有資料」的回應：避免把流量上限/暫時錯誤鎖進快取而擋住重試
+    if isinstance(data, dict) and data.get("data"):
+        with _cache_lock:
+            _cache[key] = (now, data)
+    return data
 
 
 # ---------------------------------------------------------------- 估值計算（純函式，方便測試）

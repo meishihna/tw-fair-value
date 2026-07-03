@@ -72,6 +72,19 @@ PER / PBR / 殖利率快照。介面另提供：
 - `TaiwanStockPrice` → `{date, stock_id, ..., close, ...}`（每日）
 - `TaiwanStockFinancialStatements` / `TaiwanStockBalanceSheet` / `TaiwanStockCashFlowsStatement`（季度，供內在價值模型）
 - 免費上限 300 次/小時；註冊免費 Token 後 600 次/小時（介面有選填欄位）。
+- **本機快取**：同參數查詢 15 分鐘內直接用記憶體結果、不重打 API。一次內在價值分析要打 5 支 API，而「重算」只改假設不改財報 —— 有快取後重算＝**0 次呼叫**。
+
+## 打包成免裝執行檔（選用）
+
+給沒有 Python 的使用者，可用 [PyInstaller](https://pyinstaller.org/) 打包成單一執行檔：
+
+```bash
+pip install pyinstaller
+python build.py
+```
+
+完成後在 `dist/`（Windows：`dist/tw-fair-value.exe`，約 8 MB）。雙擊即啟動本機伺服器並自動開啟瀏覽器，
+行為與直接跑 `.py` 相同；保留主控台視窗以顯示網址、按 `Ctrl+C` 結束。
 
 ## 授權
 
